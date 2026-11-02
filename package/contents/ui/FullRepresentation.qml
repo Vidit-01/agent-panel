@@ -112,6 +112,71 @@ Item {
         newChatDialog.open();
     }
 
+    function isSelectable(index) {
+        return index >= 0 && index < rows.length
+            && (rows[index].kind === "agent" || rows[index].kind === "project");
+    }
+
+    function selectFirst() {
+        for (let i = 0; i < rows.length; ++i) {
+            if (isSelectable(i)) {
+                list.currentIndex = i;
+                list.positionViewAtIndex(i, ListView.Contain);
+                return;
+            }
+        }
+    }
+
+    function moveSelection(direction) {
+        const total = rows.length;
+        if (total === 0) return;
+        let cursor = list.currentIndex;
+        if (cursor < 0) cursor = direction > 0 ? -1 : 0;
+        for (let i = 0; i < total; ++i) {
+            cursor = (cursor + direction + total) % total;
+            if (isSelectable(cursor)) {
+                list.currentIndex = cursor;
+                list.positionViewAtIndex(cursor, ListView.Contain);
+                return;
+            }
+        }
+    }
+
+    function activateSelection() {
+        const row = rows[list.currentIndex];
+        if (!row) return;
+        if (row.kind === "agent") {
+            popup.app.openSession(row.agent);
+            popup.app.expanded = false;
+        } else if (row.kind === "project") {
+            selectedProject = row.path;
+            viewMode = "agents";
+            Qt.callLater(selectFirst);
+        }
+    }
+
+    function deleteSelection() {
+        const row = rows[list.currentIndex];
+        if (row && row.kind === "agent" && row.agent.canDelete !== false && !row.agent.active)
+            confirmDelete(row.agent);
+    }
+
+    function handleEscape() {
+        if (selectedProject !== "") {
+            selectedProject = "";
+            viewMode = "projects";
+            Qt.callLater(selectFirst);
+        } else {
+            popup.app.expanded = false;
+        }
+    }
+
+    function toggleAgentsProjects() {
+        viewMode = viewMode === "agents" ? "projects" : "agents";
+        selectedProject = "";
+        Qt.callLater(selectFirst);
+    }
+
     function providerImage(provider) {
         if (["openai", "claude", "cursor", "gemini"].indexOf(provider) < 0) return "";
         return Qt.resolvedUrl("../images/" + provider + ".svg");
@@ -127,6 +192,25 @@ Item {
         if (title.indexOf("Running") === 0) return Kirigami.Theme.highlightColor;
         if (title.indexOf("Needs input") === 0) return Kirigami.Theme.neutralTextColor;
         return Kirigami.Theme.textColor;
+    }
+
+    Shortcut { sequence: "Up"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.moveSelection(-1) }
+    Shortcut { sequence: "Down"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.moveSelection(1) }
+    Shortcut { sequence: "Return"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.activateSelection() }
+    Shortcut { sequence: "Enter"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.activateSelection() }
+    Shortcut { sequence: "Delete"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.deleteSelection() }
+    Shortcut { sequence: "Ctrl+N"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.startNewChat() }
+    Shortcut { sequence: "Ctrl+Tab"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.toggleAgentsProjects() }
+    Shortcut { sequence: "Ctrl+R"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.app.refresh() }
+    Shortcut { sequence: "Ctrl+Shift+M"; context: Qt.WindowShortcut; enabled: popup.app.expanded && popup.app.agents.attention > 0; onActivated: popup.app.acknowledgeAllDone() }
+    Shortcut { sequence: "Escape"; context: Qt.WindowShortcut; enabled: popup.app.expanded; onActivated: popup.handleEscape() }
+
+    Connections {
+        target: popup.app
+        function onExpandedChanged() {
+            if (popup.app.expanded)
+                Qt.callLater(function() { list.forceActiveFocus(); popup.selectFirst(); });
+        }
     }
 
     ColumnLayout {
@@ -174,17 +258,18 @@ Item {
         }
 
         RowLayout {
+            visible: popup.selectedProject !== ""
             Layout.fillWidth: true
             spacing: Kirigami.Units.smallSpacing
             Kirigami.Icon {
-                source: popup.selectedProject === "" ? "applications-development" : "folder-open"
+                source: "folder-open"
                 Layout.preferredWidth: Kirigami.Units.iconSizes.small
                 Layout.preferredHeight: Kirigami.Units.iconSizes.small
                 opacity: 0.75
             }
             PlasmaComponents.Label {
                 Layout.fillWidth: true
-                text: popup.selectedProject !== "" ? popup.selectedProject : "All projects"
+                text: popup.selectedProject
                 font.bold: true
                 elide: Text.ElideMiddle
             }
@@ -211,10 +296,13 @@ Item {
             clip: true
             spacing: Kirigami.Units.smallSpacing
             model: popup.rows
+            focus: true
+            keyNavigationEnabled: false
 
             delegate: Item {
                 id: rowItem
                 required property var modelData
+                required property int index
                 width: list.width
                 property var rowData: modelData
                 height: rowData.kind === "agent"
@@ -272,9 +360,20 @@ Item {
                     id: projectDelegate
                     visible: rowItem.rowData.kind === "project"
                     anchors.fill: parent
+                    background: Rectangle {
+                        radius: Kirigami.Units.largeSpacing
+                        color: list.activeFocus && list.currentIndex === rowItem.index
+                            ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.28)
+                            : projectDelegate.hovered
+                                ? Qt.rgba(Kirigami.Theme.alternateBackgroundColor.r, Kirigami.Theme.alternateBackgroundColor.g, Kirigami.Theme.alternateBackgroundColor.b, 0.18)
+                                : "transparent"
+                        border.width: 0
+                    }
                     onClicked: {
+                        list.currentIndex = rowItem.index;
                         popup.selectedProject = rowItem.rowData.path;
                         popup.viewMode = "agents";
+                        Qt.callLater(popup.selectFirst);
                     }
                     contentItem: ColumnLayout {
                         spacing: Kirigami.Units.smallSpacing / 2
@@ -296,17 +395,17 @@ Item {
                             Layout.fillWidth: true
                             spacing: Kirigami.Units.largeSpacing
                             PlasmaComponents.Label {
-                                text: "● %1 running".arg(rowItem.rowData.running)
+                                text: "%1 running".arg(rowItem.rowData.running)
                                 color: Kirigami.Theme.highlightColor
                                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                             }
                             PlasmaComponents.Label {
-                                text: "● %1 need input".arg(rowItem.rowData.waiting)
+                                text: "%1 need input".arg(rowItem.rowData.waiting)
                                 color: Kirigami.Theme.neutralTextColor
                                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                             }
                             PlasmaComponents.Label {
-                                text: "● %1 finished".arg(rowItem.rowData.finished)
+                                text: "%1 finished".arg(rowItem.rowData.finished)
                                 color: Kirigami.Theme.textColor
                                 font.pointSize: Kirigami.Theme.smallFont.pointSize
                             }
@@ -326,10 +425,17 @@ Item {
                     visible: rowItem.rowData.kind === "agent"
                     enabled: visible && (rowItem.rowData.agent.canOpen !== false || rowItem.rowData.agent.opened)
                     anchors.fill: parent
-                    onClicked: popup.app.openSession(rowItem.rowData.agent)
+                    onClicked: {
+                        list.currentIndex = rowItem.index;
+                        popup.app.openSession(rowItem.rowData.agent);
+                    }
                     background: Rectangle {
                         radius: Kirigami.Units.largeSpacing
-                        color: "transparent"
+                        color: list.activeFocus && list.currentIndex === rowItem.index
+                            ? Qt.rgba(Kirigami.Theme.highlightColor.r, Kirigami.Theme.highlightColor.g, Kirigami.Theme.highlightColor.b, 0.28)
+                            : agentDelegate.hovered
+                                ? Qt.rgba(Kirigami.Theme.alternateBackgroundColor.r, Kirigami.Theme.alternateBackgroundColor.g, Kirigami.Theme.alternateBackgroundColor.b, 0.18)
+                                : "transparent"
                         border.width: 0
                     }
                     contentItem: RowLayout {
@@ -403,6 +509,7 @@ Item {
                                 || (!rowItem.rowData.agent.active && rowItem.rowData.agent.canDelete !== false)
                             Layout.alignment: Qt.AlignTop
                             onClicked: {
+                                list.currentIndex = rowItem.index;
                                 if (rowItem.rowData.agent.opened) popup.app.closeSession(rowItem.rowData.agent);
                                 else popup.confirmDelete(rowItem.rowData.agent);
                             }
