@@ -8,14 +8,46 @@ PlasmoidItem {
     fullRepresentation: FullRepresentation { app: root }
 
     property var agents: ({ "running": [], "waiting": [], "finished": [], "attention": 0, "featured": null })
+    property string agentsSignature: ""
     property bool refreshing: false
     property string launchError: ""
+
+    function sessionSignature(items) {
+        return items.map(agent => [
+            agent.id, agent.name, agent.summary, agent.project, agent.projectPath,
+            agent.provider, agent.status, agent.active, agent.needsInput,
+            agent.completedTurn, agent.completedAt, agent.attention, agent.opened,
+            agent.canOpen, agent.canDelete, agent.active ? 0 : agent.updated
+        ]);
+    }
+
+    function signatureFor(data) {
+        const featured = data.featured;
+        return JSON.stringify({
+            running: sessionSignature(data.running || []),
+            waiting: sessionSignature(data.waiting || []),
+            finished: sessionSignature(data.finished || []),
+            attention: data.attention || 0,
+            featured: featured ? [featured.id, featured.displayStatus, featured.name, featured.summary, featured.project, featured.provider] : null
+        });
+    }
 
     function refresh() {
         if (refreshing) return;
         refreshing = true;
-        source.exec("python3 \"$HOME/.local/share/plasma/plasmoids/com.vidit.agentpanel/contents/code/agents.py\"", function(out) {
-            try { agents = JSON.parse(out); } catch (e) { agents = ({ "running": [], "waiting": [], "finished": [], "attention": 0, "featured": null }); }
+        source.exec("python3 \"$HOME/.local/share/plasma/plasmoids/com.vidit.agentpanel/contents/code/agents.py\"", function(out, code, err) {
+            try {
+                if (code !== 0) throw new Error((err || out || "Session scan failed").trim());
+                const next = JSON.parse(out);
+                const nextSignature = signatureFor(next);
+                if (nextSignature !== agentsSignature) {
+                    agents = next;
+                    agentsSignature = nextSignature;
+                }
+                launchError = "";
+            } catch (error) {
+                launchError = error.message || "Could not update agent sessions";
+            }
             refreshing = false;
         });
     }
@@ -85,7 +117,7 @@ PlasmoidItem {
     }
 
     Timer {
-        interval: 5000
+        interval: 10000
         repeat: true
         running: true
         triggeredOnStart: true

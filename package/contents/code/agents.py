@@ -242,13 +242,16 @@ def open_agent_sessions():
         args = argv[1:]
         provider = environment.get("AGENT_PANEL_PROVIDER", "")
         session_id = environment.get("AGENT_PANEL_SESSION_ID", "")
-        if provider and session_id and has_terminal_ancestor(process_id):
+        # Agent Panel adds an exact provider/session marker to its launched
+        # process. Trust that marker even when the terminal is a detached
+        # server process (as Ghostty can be), so it still counts as open.
+        if provider and session_id:
             found.setdefault((provider, session_id), set()).add(process_id)
 
         # Older sessions lack the Agent Panel environment markers; recognize
         # their provider CLI arguments, but only while they're in a terminal.
         for provider, (command_name, resume_flag) in provider_flags.items():
-            if command_name in names and resume_flag in args and has_terminal_ancestor(process_id):
+            if command_name in names and resume_flag in args:
                 try:
                     session_id = args[args.index(resume_flag) + 1]
                 except IndexError:

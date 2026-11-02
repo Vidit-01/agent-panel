@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Open an agent session in the terminal selected in KDE System Settings."""
 import configparser
+import fcntl
+import hashlib
 import json
 import os
 import shlex
@@ -8,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 from agents import acknowledge_session, open_agent_sessions
@@ -219,55 +222,98 @@ def close_existing_session(provider, session_id):
     return control_window_with_kwin(title, terminal_ancestors(process_ids), [], "close")
 
 
+def acquire_session_lock(provider, session_id):
+    """Serialize launches for one session while a terminal is starting."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or os.path.join(HOME, ".local", "state")
+    directory = os.path.join(runtime, "agent-panel", "open-locks")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    key = hashlib.sha256((provider + "\0" + session_id).encode("utf-8")).hexdigest()
+    descriptor = os.open(os.path.join(directory, key + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def open_or_focus_session(provider, session_id, project_path):
+    lock_fd = acquire_session_lock(provider, session_id)
+    if lock_fd is None:
+        # The other launch may already have created its window. Focus it if
+        # visible; otherwise let the caller retry rather than spawn a twin.
+        if focus_existing_session(provider, session_id):
+            return
+        raise RuntimeError("This chat is already opening. Try again in a moment.")
+    try:
+        existing = matching_session_processes(provider, session_id)
+        if existing:
+            if focus_existing_session(provider, session_id):
+                if provider == "openai":
+                    acknowledge_session(session_id)
+                return
+            raise RuntimeError("This chat is already running, but Plasma could not focus its window. I did not open a duplicate.")
+
+        if provider == "openai":
+            executable = shutil.which("codex") or os.path.join(HOME, ".local", "bin", "codex")
+            args = ["resume", session_id]
+        elif provider == "claude":
+            executable = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+            args = ["--resume", session_id]
+        elif provider == "gemini":
+            executable = shutil.which("agy") or os.path.join(HOME, ".local", "bin", "agy")
+            args = ["--conversation", session_id]
+        elif provider == "cursor":
+            executable = shutil.which("cursor")
+            args = [project_path] if project_path else []
+            if not args:
+                raise RuntimeError("Cursor sessions can be identified, but Cursor has no supported command here to resume a specific chat.")
+        else:
+            raise RuntimeError("This agent provider cannot be opened yet.")
+        if not executable or not os.path.isfile(executable):
+            raise RuntimeError("Could not find the %s CLI." % provider)
+        title = "Agent Panel · %s · %s" % (provider, session_id)
+        launch_command = [
+            "/bin/sh", "-c",
+            'title=$1; provider=$2; session_id=$3; shift 3; '
+            'export AGENT_PANEL_PROVIDER="$provider" AGENT_PANEL_SESSION_ID="$session_id"; '
+            'printf "\\033]2;%s\\007" "$title"; exec "$@"',
+            "agent-panel-session", title, provider, session_id, executable, *args,
+        ]
+        command = kde_terminal() + launch_command
+        cwd = project_path if project_path and os.path.isdir(project_path) else None
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+            cwd=cwd,
+        )
+        if provider == "openai":
+            acknowledge_session(session_id)
+
+        # Keep the per-session lock until the CLI has had a chance to appear
+        # in /proc. A rapid second activation can then focus it instead of
+        # launching another terminal during startup.
+        deadline = time.monotonic() + 2.5
+        while time.monotonic() < deadline:
+            if matching_session_processes(provider, session_id):
+                break
+            time.sleep(0.1)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def main():
     if len(sys.argv) != 4:
         raise RuntimeError("Expected provider, session ID, and project path.")
     provider, session_id, project_path = sys.argv[1:4]
     if not session_id or any(ord(c) < 32 or ord(c) == 127 for c in session_id):
         raise RuntimeError("Invalid session ID.")
-    if focus_existing_session(provider, session_id):
-        if provider == "openai":
-            acknowledge_session(session_id)
-        return
-    if provider == "openai":
-        executable = shutil.which("codex") or os.path.join(HOME, ".local", "bin", "codex")
-        args = ["resume", session_id]
-    elif provider == "claude":
-        executable = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
-        args = ["--resume", session_id]
-    elif provider == "gemini":
-        executable = shutil.which("agy") or os.path.join(HOME, ".local", "bin", "agy")
-        args = ["--conversation", session_id]
-    elif provider == "cursor":
-        executable = shutil.which("cursor")
-        args = [project_path] if project_path else []
-        if not args:
-            raise RuntimeError("Cursor sessions can be identified, but Cursor has no supported command here to resume a specific chat.")
-    else:
-        raise RuntimeError("This agent provider cannot be opened yet.")
-    if not executable or not os.path.isfile(executable):
-        raise RuntimeError("Could not find the %s CLI." % provider)
-    title = "Agent Panel · %s · %s" % (provider, session_id)
-    launch_command = [
-        "/bin/sh", "-c",
-        'title=$1; provider=$2; session_id=$3; shift 3; '
-        'export AGENT_PANEL_PROVIDER="$provider" AGENT_PANEL_SESSION_ID="$session_id"; '
-        'printf "\\033]2;%s\\007" "$title"; exec "$@"',
-        "agent-panel-session", title, provider, session_id, executable, *args,
-    ]
-    command = kde_terminal() + launch_command
-    cwd = project_path if project_path and os.path.isdir(project_path) else None
-    subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-        cwd=cwd,
-    )
-    if provider == "openai":
-        acknowledge_session(session_id)
+    open_or_focus_session(provider, session_id, project_path)
 
 
 if __name__ == "__main__":
